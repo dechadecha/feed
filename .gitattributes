@@ -1,0 +1,5 @@
+# Скрипт и генератор едут на Linux: переводы строк только LF.
+# С CRLF bash падает с невнятным «\r: command not found».
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
