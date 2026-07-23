@@ -256,24 +256,31 @@ def collections(flats, project):
     параметр rooms сайт понимает (проверено: rooms=0 отдаёт ровно студии)."""
     base = f'{SITE}/flats?project={PROJECT}'
     render = image(project.get('image'), photo_recipe)
+    due = f'{project["completion_quarter"]} кв. {project["completion_year"]}'
+
+    # description коллекции идёт в текст объявления (name — в заголовок).
+    # Лимит Директа: 81 символ и 15 знаков препинания. Цена — минимальная
+    # по группе, без округления: округлять вниз нельзя (цена окажется ниже
+    # реальной), вверх — «от» перестанет быть правдой. Счётчик лотов убран
+    # сознательно: он меняется чаще всего и гоняет объявление по перемодерации.
 
     # Для проекта целиком уместен рендер ЖК, для групп по комнатности —
     # планировка: так плитки каталога различимы между собой, а не пять копий.
+    all_min = min(float(f['price']) for f in flats) / 1e6
     items = [('all', base, f'Квартиры в ЖК «{project["name"]}»',
-              f'{len(flats)} квартир в ЖК «{project["name"]}» — {project["address"]}. '
-              f'Срок сдачи: {project["completion_quarter"]} кв. {project["completion_year"]}.',
+              f'От {all_min:.1f} млн ₽. {project["address"]}. Сдача — {due}.',
               render)]
 
     for r in sorted({f['rooms'] for f in flats}):
         same = [f for f in flats if f['rooms'] == r]
-        prices = [float(f['price']) for f in same]
+        grp_min = min(float(f['price']) for f in same) / 1e6
+        area_min = min(float(f['area']) for f in same)
         plan = image(typical_plan(same), plan_recipe)
         items.append((
             f'rooms-{r}',
             f'{base}&rooms={r}',
             f'{cat_name(r)} в ЖК «{project["name"]}»',
-            f'{len(same)} лотов, от {min(prices) / 1e6:.1f} млн ₽, '
-            f'площадь от {min(float(f["area"]) for f in same):.1f} м².',
+            f'От {grp_min:.1f} млн ₽, площадь от {area_min:.1f} м². Сдача — {due}.',
             plan or render))
 
     out = []
