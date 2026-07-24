@@ -72,27 +72,45 @@ fi
 # приоритета: переменные окружения -> уже сохранённый feed.conf -> спросить.
 say "Источник данных"
 CONF="$APP_DIR/feed.conf"
-if [ -z "${FEED_API:-}" ] && [ -f "$CONF" ]; then
-    # shellcheck disable=SC1090
-    . "$CONF"
+if [ -z "${FEED_API:-}${FEED_YRL_URL:-}" ] && [ -f "$CONF" ]; then
+    # Читаем построчно, а не через `.` — конфиг не исполняем как код,
+    # и значения с пробелами (напр. название компании) не ломают разбор.
+    while IFS='=' read -r _k _v; do
+        case "$_k" in FEED_*) export "$_k=$_v" ;; esac
+    done < "$CONF"
     echo "  взял из $CONF"
 fi
-if [ -z "${FEED_API:-}" ] || [ -z "${FEED_SITE:-}" ] || [ -z "${FEED_PROJECT:-}" ]; then
+FEED_SOURCE=${FEED_SOURCE:-api}
+if [ -z "${FEED_API:-}${FEED_YRL_URL:-}" ]; then
     if [ -t 0 ]; then
-        echo "  Три параметра источника — выдаёт владелец репозитория:"
-        read -rp "  Адрес API (вида https://сайт/api): " FEED_API
-        read -rp "  Адрес сайта (вида https://сайт):   " FEED_SITE
-        read -rp "  Слаг проекта в API:                " FEED_PROJECT
-        read -rp "  Компания в шапке фида (Enter — имя проекта): " FEED_COMPANY
+        echo "  Параметры источника — выдаёт владелец репозитория."
+        read -rp "  Тип источника [api/yrl] (Enter — api): " ans
+        FEED_SOURCE=${ans:-api}
+        if [ "$FEED_SOURCE" = "yrl" ]; then
+            read -rp "  Адрес готового YRL-фида: " FEED_YRL_URL
+            read -rp "  Адрес сайта (вида https://сайт): " FEED_SITE
+            read -rp "  Название ЖК: " FEED_NAME
+        else
+            read -rp "  Адрес API (вида https://сайт/api): " FEED_API
+            read -rp "  Адрес сайта (вида https://сайт):   " FEED_SITE
+            read -rp "  Слаг проекта в API:                " FEED_PROJECT
+        fi
+        read -rp "  Компания в шапке фида (Enter — имя ЖК): " FEED_COMPANY
     else
         die "источник не задан. Запустите интерактивно, либо так:
-     FEED_API=... FEED_SITE=... FEED_PROJECT=... sudo -E bash setup.sh"
+     FEED_API=... FEED_SITE=... FEED_PROJECT=... sudo -E bash setup.sh
+     (для готового фида: FEED_SOURCE=yrl FEED_YRL_URL=... FEED_SITE=... FEED_NAME=...)"
     fi
 fi
 FEED_API=${FEED_API%/}; FEED_SITE=${FEED_SITE%/}
-[ -n "$FEED_API" ] && [ -n "$FEED_SITE" ] && [ -n "$FEED_PROJECT" ] \
-    || die "параметры источника не могут быть пустыми"
-echo "  API: $FEED_API | проект: $FEED_PROJECT"
+if [ "$FEED_SOURCE" = "yrl" ]; then
+    [ -n "$FEED_YRL_URL" ] || die "для yrl нужен FEED_YRL_URL"
+    echo "  источник: yrl | $FEED_YRL_URL"
+else
+    [ -n "$FEED_API" ] && [ -n "$FEED_SITE" ] && [ -n "$FEED_PROJECT" ] \
+        || die "для api нужны FEED_API, FEED_SITE, FEED_PROJECT"
+    echo "  источник: api | $FEED_API | проект: $FEED_PROJECT"
+fi
 
 # ─── 2. Зависимости ──────────────────────────────────────────────────────────
 say "Проверяю окружение"
@@ -108,11 +126,19 @@ fi
 systemctl enable --now nginx >/dev/null 2>&1 || true
 echo "  nginx: $(nginx -v 2>&1)"
 
-say "Проверяю доступ к API источника"
-CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
-       "$FEED_API/properties/?limit=1" || true)
-[ "$CODE" = "200" ] || die "API отвечает $CODE вместо 200 — сервер не видит $FEED_API"
-echo "  API: 200 OK"
+say "Проверяю доступ к источнику"
+if [ "$FEED_SOURCE" = "yrl" ]; then
+    CHECK_URL="$FEED_YRL_URL"
+else
+    CHECK_URL="$FEED_API/properties/?limit=1"
+fi
+case "$CHECK_URL" in
+    file://*) [ -f "${CHECK_URL#file://}" ] && echo "  файл на месте" \
+                  || die "файл $CHECK_URL не найден" ;;
+    *) CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$CHECK_URL" || true)
+       [ "$CODE" = "200" ] || die "источник отвечает $CODE вместо 200 — сервер его не видит"
+       echo "  источник: 200 OK" ;;
+esac
 
 # ─── 3. Файлы ────────────────────────────────────────────────────────────────
 say "Раскладываю файлы"
@@ -124,9 +150,12 @@ chown -R www-data:www-data "$FEED_DIR" 2>/dev/null || true
 # Генератор читает его сам (feed.conf рядом со скриптом), поэтому systemd,
 # cron и запуск руками работают одинаково, без переменных окружения.
 cat > "$CONF" <<EOF
-FEED_API=$FEED_API
+FEED_SOURCE=$FEED_SOURCE
+FEED_API=${FEED_API:-}
 FEED_SITE=$FEED_SITE
-FEED_PROJECT=$FEED_PROJECT
+FEED_PROJECT=${FEED_PROJECT:-}
+FEED_YRL_URL=${FEED_YRL_URL:-}
+FEED_NAME=${FEED_NAME:-}
 FEED_COMPANY=${FEED_COMPANY:-}
 FEED_BASE_URL=$BASE/feeds
 EOF
