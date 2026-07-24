@@ -84,12 +84,17 @@ FEED_SOURCE=${FEED_SOURCE:-api}
 if [ -z "${FEED_API:-}${FEED_YRL_URL:-}" ]; then
     if [ -t 0 ]; then
         echo "  Параметры источника — выдаёт владелец репозитория."
-        read -rp "  Тип источника [api/yrl] (Enter — api): " ans
+        read -rp "  Тип источника [api/yrl/csv] (Enter — api): " ans
         FEED_SOURCE=${ans:-api}
         if [ "$FEED_SOURCE" = "yrl" ]; then
             read -rp "  Адрес готового YRL-фида: " FEED_YRL_URL
             read -rp "  Адрес сайта (вида https://сайт): " FEED_SITE
             read -rp "  Название ЖК: " FEED_NAME
+        elif [ "$FEED_SOURCE" = "csv" ]; then
+            read -rp "  Путь к CSV-файлу на сервере (или Enter, если по ссылке): " FEED_CSV_PATH
+            [ -z "$FEED_CSV_PATH" ] && read -rp "  Адрес CSV (напр. Google Sheets как csv): " FEED_CSV_URL
+            read -rp "  Название ЖК: " FEED_NAME
+            read -rp "  Шаблон ссылки на лот с {id} (Enter, если ссылки есть в файле): " FEED_URL_TEMPLATE
         else
             read -rp "  Адрес API (вида https://сайт/api): " FEED_API
             read -rp "  Адрес сайта (вида https://сайт):   " FEED_SITE
@@ -106,6 +111,10 @@ FEED_API=${FEED_API%/}; FEED_SITE=${FEED_SITE%/}
 if [ "$FEED_SOURCE" = "yrl" ]; then
     [ -n "$FEED_YRL_URL" ] || die "для yrl нужен FEED_YRL_URL"
     echo "  источник: yrl | $FEED_YRL_URL"
+elif [ "$FEED_SOURCE" = "csv" ]; then
+    [ -n "${FEED_CSV_PATH:-}${FEED_CSV_URL:-}" ] || die "для csv нужен FEED_CSV_PATH или FEED_CSV_URL"
+    [ -n "${FEED_NAME:-}" ] || die "для csv нужен FEED_NAME — название ЖК"
+    echo "  источник: csv | ${FEED_CSV_PATH:-$FEED_CSV_URL}"
 else
     [ -n "$FEED_API" ] && [ -n "$FEED_SITE" ] && [ -n "$FEED_PROJECT" ] \
         || die "для api нужны FEED_API, FEED_SITE, FEED_PROJECT"
@@ -127,14 +136,14 @@ systemctl enable --now nginx >/dev/null 2>&1 || true
 echo "  nginx: $(nginx -v 2>&1)"
 
 say "Проверяю доступ к источнику"
-if [ "$FEED_SOURCE" = "yrl" ]; then
-    CHECK_URL="$FEED_YRL_URL"
-else
-    CHECK_URL="$FEED_API/properties/?limit=1"
-fi
+case "$FEED_SOURCE" in
+    yrl) CHECK_URL="$FEED_YRL_URL" ;;
+    csv) CHECK_URL="${FEED_CSV_URL:-file://$FEED_CSV_PATH}" ;;
+    *)   CHECK_URL="$FEED_API/properties/?limit=1" ;;
+esac
 case "$CHECK_URL" in
     file://*) [ -f "${CHECK_URL#file://}" ] && echo "  файл на месте" \
-                  || die "файл $CHECK_URL не найден" ;;
+                  || die "файл ${CHECK_URL#file://} не найден" ;;
     *) CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$CHECK_URL" || true)
        [ "$CODE" = "200" ] || die "источник отвечает $CODE вместо 200 — сервер его не видит"
        echo "  источник: 200 OK" ;;
@@ -152,9 +161,13 @@ chown -R www-data:www-data "$FEED_DIR" 2>/dev/null || true
 cat > "$CONF" <<EOF
 FEED_SOURCE=$FEED_SOURCE
 FEED_API=${FEED_API:-}
-FEED_SITE=$FEED_SITE
+FEED_SITE=${FEED_SITE:-}
 FEED_PROJECT=${FEED_PROJECT:-}
 FEED_YRL_URL=${FEED_YRL_URL:-}
+FEED_CSV_PATH=${FEED_CSV_PATH:-}
+FEED_CSV_URL=${FEED_CSV_URL:-}
+FEED_URL_TEMPLATE=${FEED_URL_TEMPLATE:-}
+FEED_ADDRESS=${FEED_ADDRESS:-}
 FEED_NAME=${FEED_NAME:-}
 FEED_COMPANY=${FEED_COMPANY:-}
 FEED_BASE_URL=$BASE/feeds

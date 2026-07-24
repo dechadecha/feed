@@ -11,6 +11,9 @@ YML (а не YRL) — потому что только в нём есть <oldpr
   api  — открытый JSON API сайта-источника (по умолчанию)
   yrl  — готовый YRL-фид застройщика (выгрузка для классифайдов):
          конвертируем в YML, добавляя категории и custom_label
+  csv  — таблица от клиента (CSV/выгрузка из Excel или Google Sheets):
+         колонки ищем по названиям — обязательные должны быть,
+         необязательные подтягиваем, если найдены
 
 Конфиг feed.conf лежит рядом со скриптом (создаёт setup.sh), переменные
 окружения его перекрывают:
@@ -20,7 +23,12 @@ YML (а не YRL) — потому что только в нём есть <oldpr
   FEED_SITE          адрес сайта
   FEED_PROJECT       слаг проекта в API               (для api)
   FEED_YRL_URL       адрес готового YRL-фида          (для yrl)
-  FEED_NAME          название ЖК                      (для yrl; api берёт из API)
+  FEED_CSV_PATH      путь к CSV-файлу на сервере       (для csv)
+  FEED_CSV_URL       или адрес CSV (напр. Google Sheets, опубликованный как csv)
+  FEED_URL_TEMPLATE  шаблон ссылки на лот, {id} подставится — если в csv
+                     нет колонки со ссылкой
+  FEED_ADDRESS       адрес ЖК                          (для csv/yrl, опционально)
+  FEED_NAME          название ЖК              (для yrl/csv; api берёт из API)
   FEED_COMPANY       компания в шапке фида; пусто — имя проекта
   FEED_CATALOG_URL   страница каталога                (для yrl; api строит сам)
   FEED_CATALOG_ROOMS_URL  шаблон страницы группы, {rooms} подставится
@@ -35,9 +43,12 @@ YML (а не YRL) — потому что только в нём есть <oldpr
 
     python3 build_feed.py /var/www/html/feeds/feed.xml
 """
+import csv
 import hashlib
+import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -72,8 +83,12 @@ if SOURCE == 'api' and not (API and SITE and PROJECT):
                      'Запустите setup.sh — он спросит значения и сохранит feed.conf.')
 if SOURCE == 'yrl' and not YRL_URL:
     raise SystemExit('Источник yrl: нужен FEED_YRL_URL — адрес готового YRL-фида.')
-if SOURCE not in ('api', 'yrl'):
-    raise SystemExit(f'Неизвестный FEED_SOURCE={SOURCE!r}, допустимо: api, yrl')
+if SOURCE == 'csv' and not (_C.get('FEED_CSV_PATH') or _C.get('FEED_CSV_URL')):
+    raise SystemExit('Источник csv: нужен FEED_CSV_PATH (файл) или FEED_CSV_URL.')
+if SOURCE == 'csv' and not _C.get('FEED_NAME'):
+    raise SystemExit('Источник csv: нужен FEED_NAME — название ЖК для шапки фида.')
+if SOURCE not in ('api', 'yrl', 'csv'):
+    raise SystemExit(f'Неизвестный FEED_SOURCE={SOURCE!r}, допустимо: api, yrl, csv')
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else 'feed.xml'
 MSK = timezone(timedelta(hours=3))
@@ -119,21 +134,27 @@ PAD_H = (CANVAS - PLAN_W) // 2
 
 def plan_recipe(url):
     """Планировка: вписать в окно с белыми полями, убрать прозрачность (@jpg).
-    Шаблон можно переопределить в конфиге (FEED_PLAN_RECIPE, {url} подставится);
-    по умолчанию — imgproxy сайта-источника."""
+    Шаблон берётся из FEED_PLAN_RECIPE ({url} подставится). Если он не задан —
+    imgproxy-рецепт применяем только к api-источнику (там imgproxy заведомо
+    есть); для yrl/csv картинку отдаём как есть — у них готовые ссылки."""
     tpl = _C.get('FEED_PLAN_RECIPE', '').strip()
     if tpl:
         return tpl.format(url=url)
+    if SOURCE != 'api':
+        return url
     return (f'{SITE}/proxy/insecure/w:{PLAN_W}/h:{PLAN_H}/rt:fit/ex:1'
             f'/pd:{PAD_V}:{PAD_H}/q:85/plain/{url}@jpg')
 
 
 def photo_recipe(url):
     """Фото ЖК под квадратную плитку: обрезаем сами (rt:fill), а не отдаём это
-    Директу. Полей не делаем — для фотографии кроп уместнее, чем белые полосы."""
+    Директу. Полей не делаем — для фотографии кроп уместнее, чем белые полосы.
+    Как и plan_recipe: дефолтный imgproxy только для api, иначе — url как есть."""
     tpl = _C.get('FEED_PHOTO_RECIPE', '').strip()
     if tpl:
         return tpl.format(url=url)
+    if SOURCE != 'api':
+        return url
     return f'{SITE}/proxy/insecure/w:1200/h:1200/rt:fill/q:85/plain/{url}@jpg'
 
 
@@ -307,7 +328,189 @@ def source_yrl():
     return project, lots
 
 
-SOURCES = {'api': source_api, 'yrl': source_yrl}
+# Колонки CSV ищем по названиям. У поля несколько принятых синонимов —
+# менеджеры называют столбцы по-разному. Сопоставление нечёткое: заголовок
+# совпадает с синонимом целиком или начинается с него на границе слова
+# («Цена, руб» → цена, «Цена за метр» → ppm, а не price — берём длиннейший).
+FIELD_ALIASES = {
+    # обязательные
+    'id':           ['id', 'ид', 'идентификатор', 'артикул', 'код лота', 'код'],
+    'url':          ['url', 'ссылка на лот', 'ссылка на страницу', 'ссылка', 'страница'],
+    'rooms':        ['комнатность', 'количество комнат', 'кол-во комнат',
+                     'комнат', 'комнаты', 'rooms'],
+    'area':         ['общая площадь', 'площадь', 'метраж', 'area'],
+    'price':        ['цена со скидкой', 'актуальная цена', 'цена', 'стоимость', 'price'],
+    # необязательные
+    'oldprice':     ['цена без скидки', 'цена до скидки', 'старая цена',
+                     'старая стоимость', 'базовая цена', 'oldprice'],
+    'floor':        ['этаж', 'floor'],
+    'floors_total': ['этажей всего', 'всего этажей', 'этажность', 'этажей', 'floors'],
+    'building':     ['корпус', 'литер', 'building'],
+    'section':      ['секция', 'подъезд', 'section'],
+    'number':       ['номер квартиры', 'квартира', 'apartments', 'apartment'],
+    'ppm':          ['цена за квадратный метр', 'цена за метр', 'цена за м2',
+                     'цена за кв.м', 'за метр', 'price per meter'],
+    'finishing':    ['тип отделки', 'отделка', 'renovation'],
+    'features':     ['удобства', 'особенности', 'характеристики', 'теги', 'features'],
+    'promo':        ['спецпредложение', 'акция', 'скидка', 'промо', 'promo'],
+    'plan':         ['ссылка на планировку', 'планировка', 'план', 'изображение',
+                     'картинка', 'фото', 'image', 'plan'],
+    'due':          ['ввод в эксплуатацию', 'срок сдачи', 'сдача', 'готовность',
+                     'срок', 'due'],
+    'address':      ['адрес', 'address'],
+}
+REQUIRED_CSV = ('id', 'url', 'rooms', 'area', 'price')
+
+
+def _norm_head(h):
+    return ' '.join((h or '').strip().lower().replace('ё', 'е').split())
+
+
+def _match_columns(headers):
+    """Заголовок -> поле. Длиннейший подходящий синоним выигрывает, поле
+    занимает первый подходящий столбец (дубли игнорируются)."""
+    pairs = sorted(((_norm_head(a), f) for f, al in FIELD_ALIASES.items() for a in al),
+                   key=lambda p: -len(p[0]))
+    colmap = {}
+    for idx, raw in enumerate(headers):
+        h = _norm_head(raw)
+        if not h:
+            continue
+        for alias, field in pairs:
+            if field in colmap:
+                continue
+            boundary = h == alias or (h.startswith(alias) and not h[len(alias)].isalnum())
+            if boundary:
+                colmap[field] = idx
+                break
+    return colmap
+
+
+def _num(v):
+    """'15 000 000 ₽' -> '15000000', '42,5 м²' -> '42.5'. None, если чисел нет."""
+    if not v:
+        return None
+    v = v.replace('\xa0', '').replace(' ', '').replace(',', '.')
+    m = re.search(r'-?\d+(?:\.\d+)?', v)
+    return m.group() if m else None
+
+
+def _rooms_val(v):
+    v = (v or '').strip().lower()
+    if not v or 'студ' in v or 'studio' in v:
+        return 0
+    m = re.search(r'\d+', v)
+    return int(m.group()) if m else 0
+
+
+def _columns_help():
+    lines = ['  обязательные:']
+    for f in REQUIRED_CSV:
+        lines.append(f'    {f:13} ← ' + ', '.join(FIELD_ALIASES[f][:4]))
+    lines.append('  необязательные (подтянутся, если есть):')
+    for f in FIELD_ALIASES:
+        if f not in REQUIRED_CSV:
+            lines.append(f'    {f:13} ← ' + ', '.join(FIELD_ALIASES[f][:4]))
+    return '\n'.join(lines)
+
+
+def _read_csv_bytes():
+    src = _C.get('FEED_CSV_PATH') or _C.get('FEED_CSV_URL')
+    if _C.get('FEED_CSV_PATH'):
+        path = _C['FEED_CSV_PATH']
+        age_days = (time.time() - os.path.getmtime(path)) / 86400
+        limit = float(_C.get('FEED_CSV_MAX_AGE_DAYS', 14))
+        if age_days > limit:
+            print(f'  ВНИМАНИЕ: {path} не обновлялся {age_days:.0f} дней '
+                  f'(порог {limit:.0f}) — данные могут быть устаревшими', file=sys.stderr)
+        return open(path, 'rb').read()
+    return fetch(src)
+
+
+def source_csv():
+    """Таблица от клиента. Колонки — по названиям (см. FIELD_ALIASES).
+    Кодировка: UTF-8 (в т.ч. с BOM) или CP1251. Разделитель определяется сам."""
+    raw = _read_csv_bytes()
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        text = raw.decode('cp1251')
+    sample = text[:4096]
+    try:
+        delim = csv.Sniffer().sniff(sample, delimiters=',;\t').delimiter
+    except csv.Error:
+        delim = ';' if sample.count(';') >= sample.count(',') else ','
+
+    rows = list(csv.reader(io.StringIO(text), delimiter=delim))
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if len(rows) < 2:
+        raise SystemExit('CSV пуст или в нём только заголовок — фид не перезаписываю')
+
+    colmap = _match_columns(rows[0])
+    have_url = 'url' in colmap or _C.get('FEED_URL_TEMPLATE')
+    missing = [f for f in REQUIRED_CSV if f not in colmap and not (f == 'url' and have_url)]
+    if missing:
+        raise SystemExit(
+            'В CSV не нашлись обязательные колонки: ' + ', '.join(missing) + '.\n'
+            'Заголовки в файле: ' + ', '.join(h for h in rows[0] if h.strip()) + '\n'
+            'Как называть колонки:\n' + _columns_help() + '\n'
+            '(если ссылок на лоты нет — задайте FEED_URL_TEMPLATE с {id}).')
+
+    def cell(row, field):
+        idx = colmap.get(field)
+        return row[idx].strip() if idx is not None and idx < len(row) else ''
+
+    url_tpl = _C.get('FEED_URL_TEMPLATE', '')
+    lots = []
+    for row in rows[1:]:
+        lot_id = cell(row, 'id')
+        price = _num(cell(row, 'price'))
+        area = _num(cell(row, 'area'))
+        if not (lot_id and price and area):
+            continue
+        url = cell(row, 'url') or (url_tpl.format(id=lot_id) if url_tpl else '')
+        if not url:
+            continue
+        oldp = _num(cell(row, 'oldprice'))
+        feats = [x.strip() for x in re.split(r'[;,|]', cell(row, 'features')) if x.strip()]
+        lots.append({
+            'id': lot_id,
+            'url': url,
+            'rooms': _rooms_val(cell(row, 'rooms')),
+            'area': area,
+            'price': float(price),
+            'oldprice': float(oldp) if oldp else None,
+            'floor': cell(row, 'floor') or None,
+            'floors_total': cell(row, 'floors_total') or None,
+            'building': cell(row, 'building') or None,
+            'section': cell(row, 'section') or None,
+            'number': cell(row, 'number') or None,
+            'ppm': _num(cell(row, 'ppm')),
+            'finishing': cell(row, 'finishing') or None,
+            'features': feats,
+            'promo': cell(row, 'promo') or None,
+            'plan': cell(row, 'plan') or None,
+            'plan2': None,
+            'due': cell(row, 'due') or None,
+        })
+    if not lots:
+        raise SystemExit('в CSV нет пригодных строк (нужны id, цена, площадь, ссылка) '
+                         '— фид не перезаписываю')
+    lots.sort(key=lambda l: str(l['id']))
+
+    project = {
+        'name': _C['FEED_NAME'],
+        'address': _C.get('FEED_ADDRESS') or None,
+        'image': None,
+        'due': lots[0]['due'],
+        'page': SITE or _C.get('FEED_CATALOG_URL') or lots[0]['url'],
+        'catalog': _C.get('FEED_CATALOG_URL') or None,
+        'catalog_rooms': _C.get('FEED_CATALOG_ROOMS_URL') or None,
+    }
+    return project, lots
+
+
+SOURCES = {'api': source_api, 'yrl': source_yrl, 'csv': source_csv}
 
 
 # ─── Сборка XML ──────────────────────────────────────────────────────────────
